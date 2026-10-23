@@ -1,0 +1,122 @@
+# ---------------------------------------------------------------------------
+# B4 Data Sync — GitHub Actions workflow (event-driven + cron parity floor).
+#
+# Place this file at .github/workflows/data-sync.yml in the ember-signal repo
+# (aungmyatm187-ship-it/ember-signal).
+#
+# Triggers:
+#   1. schedule       — every 30 minutes (parity floor: no matter what, the
+#                       storefront never lags the backend by more than 30 min)
+#   2. repository_dispatch (type: evidence-updated) — EVENT-DRIVEN: the
+#                       ember-signal-backend repo fires this the moment new
+#                       evidence is pushed (snippet in EXECUTION-PLAN.md)
+#   3. workflow_dispatch — manual "Sync now" button
+#
+# What it does:
+#   Generates a fresh Ed25519 request signature (LUMA_SYNC_PRIVATE_KEY secret
+#   -> matches LUMA_TRUST_PUBLIC_KEYS on ember-signal-web) and POSTs to the
+#   B5-protected endpoint POST /api/sync/run on ember-signal-web. Retries with
+#   exponential backoff (Render cold start) and fails the workflow loudly if
+#   the sync did not land — observability for free.
+#
+# Required secret:
+#   LUMA_SYNC_PRIVATE_KEY   base64 Ed25519 private key (from b5-trust-bridge/keygen.py)
+#   SYNC_TARGET_URL         e.g. https://ember-signal-web.onrender.com  (repo variable, or hardcode below)
+# ---------------------------------------------------------------------------
+
+name: Data Sync (B4)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  repository_dispatch:
+    types: [evidence-updated]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: data-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Signed sync trigger
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SYNC_TARGET_URL: ${{ vars.SYNC_TARGET_URL || 'https://ember-signal-web.onrender.com' }}
+      KEY_ID: sync-main
+    steps:
+      - name: Trigger signed sync (Ed25519 + exponential backoff)
+        env:
+          LUMA_SYNC_PRIVATE_KEY: ${{ secrets.LUMA_SYNC_PRIVATE_KEY }}
+        run: |
+          pip install --quiet cryptography
+
+          python - <<'EOF'
+          import base64, json, os, sys, time
+          import urllib.request, urllib.error
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+          from cryptography.hazmat.primitives import hashes
+
+          target = os.environ["SYNC_TARGET_URL"].rstrip("/") + "/api/sync/run"
+          key_id = os.environ["KEY_ID"]
+          key_bytes = base64.b64decode(os.environ["LUMA_SYNC_PRIVATE_KEY"])
+          private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
+
+          def sign(timestamp: str) -> dict:
+              # canonical message MUST match b5-trust-bridge/trust.py
+              import hashlib
+              msg = f"{timestamp}|POST|/api/sync/run|".encode() + hashlib.sha256(b"").digest()
+              sig = private_key.sign(msg)
+              return {
+                  "Content-Type": "application/json",
+                  "X-Luma-Timestamp": timestamp,
+                  "X-Luma-Key-Id": key_id,
+                  "X-Luma-Signature": base64.b64encode(sig).decode(),
+              }
+
+          delays = [2, 4, 8, 16]   # exponential backoff, ~30 s total
+          last_detail = "unknown"
+          for attempt, delay in enumerate([0] + delays, start=1):
+              if attempt > 1:
+                  print(f"attempt {attempt}: retrying after {delay}s backoff", flush=True)
+                  time.sleep(delay)
+              timestamp = str(int(time.time()))
+              req = urllib.request.Request(target, data=b"", method="POST", headers=sign(timestamp))
+              try:
+                  with urllib.request.urlopen(req, timeout=120) as res:
+                      body = json.loads(res.read().decode())
+                  print(json.dumps(body, indent=2), flush=True)
+                  if body.get("status") == "ok":
+                      print("SYNC OK", flush=True)
+                      sys.exit(0)
+                  last_detail = json.dumps(body)
+              except urllib.error.HTTPError as exc:
+                  last_detail = f"HTTP {exc.code}: {exc.read().decode()[:400]}"
+                  print(f"attempt {attempt} failed: {last_detail}", flush=True)
+              except Exception as exc:
+                  last_detail = str(exc)[:400]
+                  print(f"attempt {attempt} failed: {last_detail}", flush=True)
+
+          print(f"::error::sync failed after all attempts — last response: {last_detail}")
+          sys.exit(1)
+          EOF
+
+      - name: Verify parity after sync
+        run: |
+          sleep 5
+          STATUS_URL="${SYNC_TARGET_URL}/api/sync/status"
+          RESPONSE=$(curl -fsS --max-time 60 "$STATUS_URL") || { echo "::error::status endpoint unreachable"; exit 1; }
+          echo "$RESPONSE" | python3 -c "
+          import json, sys
+          body = json.load(sys.stdin)
+          sync = body.get('sync', {})
+          print(json.dumps(sync, indent=2))
+          assert body.get('status') == 'ok', body
+          assert sync.get('ok') is True, sync
+          assert sync.get('records', 0) > 0, 'no records published'
+          print('PARITY VERIFIED')
+          "
