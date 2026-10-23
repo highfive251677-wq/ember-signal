@@ -23,13 +23,13 @@ jobs:
     env:
       EMBER_SIGNAL_URL: ${{ vars.EMBER_SIGNAL_URL || 'https://ember-signal-web.onrender.com' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
       # The engine is not on PyPI yet, so it is checked out rather than pip-installed.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: aungmyatm187-ship-it/ember-lite
           path: ember-lite
