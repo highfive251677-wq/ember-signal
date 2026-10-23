@@ -27,7 +27,7 @@ jobs:
         run: python ember-lite/scripts/run_gate.py | tee gate.out
       - name: Comment on PR
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
